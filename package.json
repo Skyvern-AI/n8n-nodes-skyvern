@@ -22,7 +22,6 @@
   "packageManager": "pnpm@9.1.4",
   "main": "index.js",
   "scripts": {
-    "preinstall": "npx only-allow pnpm",
     "build": "rimraf dist && tsc && gulp build:icons",
     "dev": "tsc --watch",
     "format": "prettier nodes credentials --write",
