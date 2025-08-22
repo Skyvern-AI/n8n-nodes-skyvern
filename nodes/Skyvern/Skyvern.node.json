@@ -9,13 +9,14 @@
 	"resources": {
 		"credentialDocumentation": [
 			{
-				"url": ""
+				"url": "https://docs.skyvern.com/getting-started/quickstart"
 			}
 		],
 		"primaryDocumentation": [
 			{
-				"url": ""
+				"url": "https://docs.skyvern.com/introduction"
 			}
 		]
-	}
+	},
+	"documentationUrl": "https://docs.skyvern.com/integrations/n8n"
 }
