@@ -24,6 +24,7 @@
   "scripts": {
     "build": "rimraf dist && tsc && gulp build:icons",
     "dev": "tsc --watch",
+    "test": "pnpm build && node --test tests/*.test.js",
     "format": "prettier nodes credentials --write",
     "lint": "eslint nodes credentials package.json",
     "lintfix": "eslint nodes credentials package.json --fix",
