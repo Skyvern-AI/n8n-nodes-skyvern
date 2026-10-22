@@ -193,7 +193,7 @@ export class Skyvern implements INodeType {
                                     `/api/v1/workflows/${workflowId}`,
                                 );
                                 for (const parameter of workflow.workflow_definition.parameters as any[]) {
-                                    const value = data[parameter.key];
+                                    let value = data[parameter.key];
                                     if (value === undefined || value === null) continue;
 
                                     const type = parameter.parameter_type === 'credential' ? 'credential_id' :
@@ -210,7 +210,10 @@ export class Skyvern implements INodeType {
                                             expected = 'a credential ID';
                                             break;
                                         case 'integer':
-                                            if (typeof value === 'number' && Number.isInteger(value)) continue;
+                                            if (
+                                                (typeof value === 'number' && Number.isInteger(value)) ||
+                                                (typeof value === 'string' && /^[+-]?\d+$/.test(value.trim()))
+                                            ) continue;
                                             expected = 'an integer';
                                             break;
                                         case 'float':
@@ -218,10 +221,17 @@ export class Skyvern implements INodeType {
                                             expected = 'a number';
                                             break;
                                         case 'boolean':
-                                            if (typeof value === 'boolean') continue;
+                                            if (typeof value === 'boolean' || value === 'true' || value === 'false') continue;
                                             expected = 'a boolean';
                                             break;
                                         case 'json':
+                                            if (typeof value === 'string') {
+                                                try {
+                                                    value = JSON.parse(value);
+                                                } catch {
+                                                    // Invalid JSON remains a string and fails the type check below.
+                                                }
+                                            }
                                             if (typeof value === 'object' && value !== null) continue;
                                             expected = 'a JSON object or array';
                                             break;
@@ -567,7 +577,7 @@ export class Skyvern implements INodeType {
                 );
                 const parameters: any[] = workflow.workflow_definition.parameters;
                 let credentials: any[] | undefined;
-                if (parameters.some((parameter: any) => parameter.parameter_type === 'credential')) {
+                if (parameters.some((parameter: any) => parameter.parameter_type === 'workflow' && parameter.workflow_parameter_type === 'credential_id')) {
                     try {
                         credentials = await skyvernApiRequestAllPages.call(this, '/api/v1/credentials');
                     } catch {
@@ -577,11 +587,11 @@ export class Skyvern implements INodeType {
 
                 const fields: ResourceMapperField[] = await Promise.all(
                     parameters
-                        .filter((parameter: any) => parameter.parameter_type === 'workflow' || parameter.parameter_type === 'credential')
+                        .filter((parameter: any) => parameter.parameter_type === 'workflow')
                         .map(async (parameter: any) => {
                             let options: INodePropertyOptions[] | undefined = undefined;
                             let parameterType: FieldType | undefined = undefined;
-                            if (parameter.parameter_type === 'credential') {
+                            if (parameter.workflow_parameter_type === 'credential_id') {
                                 if (credentials === undefined) {
                                     parameterType = 'string';
                                 } else {
