@@ -125,3 +125,20 @@ test('browser session options map to top-level request fields', () => {
         assert.equal(property.routing.request.body[field], '={{$value ? $value : null}}');
     }
 });
+
+// QA repro (DO NOT MERGE): the n8n editor stores a resource-mapper "object" field as JSON text,
+// and declarative routing reads the whole resourceMapper parameter, so n8n never converts it.
+// 0.0.11 sent this value and the API parsed it; the new preSend rejects it.
+test('JSON parameter typed in the n8n editor is accepted', async () => {
+    const context = makeContext({
+        request: () => ({
+            workflow_definition: {
+                parameters: [{ key: 'config', parameter_type: 'workflow', workflow_parameter_type: 'json' }],
+            },
+        }),
+    });
+    const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+    const preSend = operation.routing.send.preSend[0];
+
+    await assert.doesNotReject(() => preSend.call(context, { body: { data: { config: '{"k": 1}' } } }));
+});
