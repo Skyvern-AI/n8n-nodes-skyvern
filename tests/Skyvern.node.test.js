@@ -125,3 +125,33 @@ test('browser session options map to top-level request fields', () => {
         assert.equal(property.routing.request.body[field], '={{$value ? $value : null}}');
     }
 });
+
+// QA repro (DO NOT MERGE): these behaviours had no test; each one-line mutation of them kept the suite green.
+test('Get a Workflow Run path carries both the workflow and the run ID', () => {
+    const runId = new Skyvern().description.properties.find((property) => property.name === 'workflowRunId');
+    const url = runId.routing.request.url;
+    assert.match(url, /\$parameter\["workflowId"\]/);
+    assert.match(url, /\/runs\/" \+ \$value/);
+});
+
+for (const [type, wrong] of [
+    ['boolean', 'yes'],
+    ['json', 42],
+    ['float', 'NaN'],
+    ['credential_id', 7],
+]) {
+    test(`invalid ${type} workflow parameter fails before dispatch`, async () => {
+        const context = makeContext({
+            request: () => ({
+                workflow_definition: {
+                    parameters: [{ key: 'field', parameter_type: 'workflow', workflow_parameter_type: type }],
+                },
+            }),
+        });
+        const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+        const preSend = operation.routing.send.preSend[0];
+
+        await assert.rejects(() => preSend.call(context, { body: { data: { field: wrong } } }), /field/);
+        assert.equal(context.calls.length, 1);
+    });
+}
