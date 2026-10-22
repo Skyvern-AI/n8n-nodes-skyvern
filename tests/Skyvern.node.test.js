@@ -125,3 +125,28 @@ test('browser session options map to top-level request fields', () => {
         assert.equal(property.routing.request.body[field], '={{$value ? $value : null}}');
     }
 });
+
+// QA repro (DO NOT MERGE): run-time credential inputs are workflow parameters with
+// workflow_parameter_type "credential_id". The picker only handles parameter_type "credential"
+// (a fixed credential the API never reads from run data), so these inputs get no type and no picker.
+test('credential_id workflow input gets the credential picker', async () => {
+    const context = makeContext({
+        request: (url) => {
+            if (url.startsWith('/api/v1/workflows/')) {
+                return {
+                    workflow_definition: {
+                        parameters: [
+                            { key: 'login', parameter_type: 'workflow', workflow_parameter_type: 'credential_id', default_value: null },
+                        ],
+                    },
+                };
+            }
+            return [{ name: 'Credential A', credential_id: 'cred_a' }];
+        },
+    });
+
+    const fields = await new Skyvern().methods.resourceMapping.getWorkflowRunParameters.call(context);
+
+    assert.equal(fields.fields[0].type, 'options');
+    assert.deepEqual(fields.fields[0].options, [{ name: 'Credential A', value: 'cred_a' }]);
+});
