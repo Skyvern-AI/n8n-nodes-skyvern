@@ -8,6 +8,7 @@ import {
     INodePropertyOptions,
     INodeType,
     INodeTypeDescription,
+    NodeOperationError,
     NodeConnectionType,
     ResourceMapperField,
     ResourceMapperFields,
@@ -28,6 +29,23 @@ async function skyvernApiRequest(
         json: true,
     };
     return this.helpers.requestWithAuthentication.call(this, 'skyvernApi', options);
+}
+
+async function skyvernApiRequestAllPages<T>(
+    this: IExecuteSingleFunctions | ILoadOptionsFunctions,
+    endpoint: string,
+): Promise<T[]> {
+    const pageSize = 100;
+    const results: T[] = [];
+    for (let page = 1; ; page++) {
+        const data = (await skyvernApiRequest.call(
+            this,
+            'GET',
+            `${endpoint}?page=${page}&page_size=${pageSize}`,
+        )) as T[];
+        results.push(...data);
+        if (data.length < pageSize) return results;
+    }
 }
 
 export class Skyvern implements INodeType {
@@ -152,6 +170,72 @@ export class Skyvern implements INodeType {
                     request: {
                         baseURL: '={{$credentials.baseUrl}}',
                         method: '={{ $value === "dispatchWorkflow" ? "POST" : "GET" }}' as IHttpRequestMethods,
+                    },
+                    send: {
+                        preSend: [
+                            async function (
+                                this: IExecuteSingleFunctions,
+                                requestOptions: IHttpRequestOptions,
+                            ): Promise<IHttpRequestOptions> {
+                                if (this.getNodeParameter('workflowOperation') !== 'dispatchWorkflow') {
+                                    return requestOptions;
+                                }
+
+                                const data = (requestOptions.body as IDataObject | undefined)?.data as
+                                    | IDataObject
+                                    | undefined;
+                                if (!data) return requestOptions;
+
+                                const workflowId = this.getNodeParameter('workflowId') as string;
+                                const workflow = await skyvernApiRequest.call(
+                                    this,
+                                    'GET',
+                                    `/api/v1/workflows/${workflowId}`,
+                                );
+                                for (const parameter of workflow.workflow_definition.parameters as any[]) {
+                                    const value = data[parameter.key];
+                                    if (value === undefined || value === null) continue;
+
+                                    const type = parameter.parameter_type === 'credential' ? 'credential_id' :
+                                        parameter.workflow_parameter_type;
+                                    let expected: string;
+                                    switch (type) {
+                                        case 'string':
+                                        case 'file_url':
+                                            if (typeof value === 'string') continue;
+                                            expected = 'a string';
+                                            break;
+                                        case 'credential_id':
+                                            if (typeof value === 'string') continue;
+                                            expected = 'a credential ID';
+                                            break;
+                                        case 'integer':
+                                            if (typeof value === 'number' && Number.isInteger(value)) continue;
+                                            expected = 'an integer';
+                                            break;
+                                        case 'float':
+                                            if (typeof value === 'number' && Number.isFinite(value)) continue;
+                                            expected = 'a number';
+                                            break;
+                                        case 'boolean':
+                                            if (typeof value === 'boolean') continue;
+                                            expected = 'a boolean';
+                                            break;
+                                        case 'json':
+                                            if (typeof value === 'object' && value !== null) continue;
+                                            expected = 'a JSON object or array';
+                                            break;
+                                        default:
+                                            continue;
+                                    }
+                                    throw new NodeOperationError(
+                                        this.getNode(),
+                                        `Workflow parameter "${parameter.key}" must be ${expected}.`,
+                                    );
+                                }
+                                return requestOptions;
+                            },
+                        ],
                     },
                 },
             },
@@ -383,6 +467,48 @@ export class Skyvern implements INodeType {
                 },
             },
             {
+                displayName: 'Workflow Options',
+                name: 'workflowOptions',
+                type: 'collection',
+                description: 'Optional browser configuration for this workflow run',
+                placeholder: 'Add Workflow Options',
+                default: {},
+                options: [
+                    {
+                        displayName: 'Browser Session ID',
+                        name: 'browserSessionId',
+                        type: 'string',
+                        default: '',
+                        routing: {
+                            request: {
+                                body: {
+                                    browser_session_id: '={{$value ? $value : null}}',
+                                },
+                            },
+                        },
+                    },
+                    {
+                        displayName: 'Browser Profile ID',
+                        name: 'browserProfileId',
+                        type: 'string',
+                        default: '',
+                        routing: {
+                            request: {
+                                body: {
+                                    browser_profile_id: '={{$value ? $value : null}}',
+                                },
+                            },
+                        },
+                    },
+                ],
+                displayOptions: {
+                    show: {
+                        resource: ['workflow'],
+                        workflowOperation: ['dispatchWorkflow'],
+                    },
+                },
+            },
+            {
                 displayName: 'Webhook Callback URL',
                 description: 'Optional URL that Skyvern will call when the workflow run finishes',
                 name: 'webhookCallbackUrl',
@@ -413,12 +539,10 @@ export class Skyvern implements INodeType {
                 const resource = this.getCurrentNodeParameter('resource') as string;
                 if (resource !== 'workflow') return [];
 
-                const response = await skyvernApiRequest.call(
+                const data = await skyvernApiRequestAllPages.call(
                     this,
-                    'GET',
-                    '/api/v1/workflows?page_size=100',
+                    '/api/v1/workflows',
                 );
-                const data = response;
                 return data.map((workflow: any) => ({
                     name: workflow.title,
                     value: workflow.workflow_permanent_id,
@@ -442,6 +566,14 @@ export class Skyvern implements INodeType {
                     `/api/v1/workflows/${workflowId}`,
                 );
                 const parameters: any[] = workflow.workflow_definition.parameters;
+                let credentials: any[] | undefined;
+                if (parameters.some((parameter: any) => parameter.parameter_type === 'credential')) {
+                    try {
+                        credentials = await skyvernApiRequestAllPages.call(this, '/api/v1/credentials');
+                    } catch {
+                        credentials = undefined;
+                    }
+                }
 
                 const fields: ResourceMapperField[] = await Promise.all(
                     parameters
@@ -450,16 +582,15 @@ export class Skyvern implements INodeType {
                             let options: INodePropertyOptions[] | undefined = undefined;
                             let parameterType: FieldType | undefined = undefined;
                             if (parameter.parameter_type === 'credential') {
-                                const credData = await skyvernApiRequest.call(
-                                    this,
-                                    'GET',
-                                    '/api/v1/credentials',
-                                );
-                                options = credData.map((credential: any) => ({
-                                    name: credential.name,
-                                    value: credential.credential_id,
-                                }));
-                                parameterType = 'options';
+                                if (credentials === undefined) {
+                                    parameterType = 'string';
+                                } else {
+                                    options = credentials.map((credential: any) => ({
+                                        name: credential.name,
+                                        value: credential.credential_id,
+                                    }));
+                                    parameterType = 'options';
+                                }
                             } else {
                                 const parameter_type_map: Record<string, FieldType> = {
                                     string: 'string',
