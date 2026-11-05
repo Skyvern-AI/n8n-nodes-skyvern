@@ -126,9 +126,8 @@ test('browser session options map to top-level request fields', () => {
     }
 });
 
-// QA repro (DO NOT MERGE): the n8n editor stores a resource-mapper "object" field as JSON text,
-// and declarative routing reads the whole resourceMapper parameter, so n8n never converts it.
-// 0.0.11 sent this value and the API parsed it; the new preSend rejects it.
+// Regression: the n8n editor stores a resource-mapper "object" field as JSON text, and declarative
+// routing passes it through unconverted, so preSend must accept JSON text.
 test('JSON parameter typed in the n8n editor is accepted', async () => {
     const context = makeContext({
         request: () => ({
@@ -182,9 +181,8 @@ for (const [type, value] of [
     });
 }
 
-// QA repro (DO NOT MERGE): run-time credential inputs are workflow parameters with
-// workflow_parameter_type "credential_id". The picker only handles parameter_type "credential"
-// (a fixed credential the API never reads from run data), so these inputs get no type and no picker.
+// Regression: run-time credential inputs are workflow parameters with workflow_parameter_type
+// "credential_id" and must get the credential picker; fixed "credential" parameters are not run inputs.
 test('credential_id workflow input gets the credential picker', async () => {
     const context = makeContext({
         request: (url) => {
@@ -207,7 +205,7 @@ test('credential_id workflow input gets the credential picker', async () => {
     assert.deepEqual(fields.fields[0].options, [{ name: 'Credential A', value: 'cred_a' }]);
 });
 
-// QA repro (DO NOT MERGE): these behaviours had no test; each one-line mutation of them kept the suite green.
+// Regression coverage for the Get path and boolean/JSON validation.
 test('Get a Workflow Run path carries both the workflow and the run ID', () => {
     const runId = new Skyvern().description.properties.find((property) => property.name === 'workflowRunId');
     const url = runId.routing.request.url;
