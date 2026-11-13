@@ -201,6 +201,8 @@ export class Skyvern implements INodeType {
                                     let expected: string;
                                     switch (type) {
                                         case 'string':
+                                            // The API stringifies expression results; keep the supplied value unchanged.
+                                            continue;
                                         case 'file_url':
                                             if (typeof value === 'string') continue;
                                             expected = 'a string';
@@ -217,11 +219,20 @@ export class Skyvern implements INodeType {
                                             expected = 'an integer';
                                             break;
                                         case 'float':
-                                            if (typeof value === 'number' && Number.isFinite(value)) continue;
+                                            // Python float() accepts decimal/exponent strings with digit separators, not hex.
+                                            if (
+                                                (typeof value === 'number' && Number.isFinite(value)) ||
+                                                (typeof value === 'string' &&
+                                                    /^[+-]?(?:\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)(?:[eE][+-]?\d(?:_?\d)*)?$/.test(value.trim()) &&
+                                                    Number.isFinite(Number(value.replace(/_/g, ''))))
+                                            ) continue;
                                             expected = 'a number';
                                             break;
                                         case 'boolean':
-                                            if (typeof value === 'boolean' || value === 'true' || value === 'false') continue;
+                                            if (
+                                                typeof value === 'boolean' || value === 1 || value === 0 ||
+                                                (typeof value === 'string' && ['true', 'false', '1', '0'].includes(value.toLowerCase()))
+                                            ) continue;
                                             expected = 'a boolean';
                                             break;
                                         case 'json':

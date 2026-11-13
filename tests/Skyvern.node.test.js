@@ -4,12 +4,13 @@ const { Skyvern } = require('../dist/nodes/Skyvern/Skyvern.node.js');
 
 const pageSize = 100;
 
-function makeContext({ request }) {
+function makeContext({ request, parameters = {} }) {
     const calls = [];
     const nodeParameters = {
         resource: 'workflow',
         workflowOperation: 'dispatchWorkflow',
         workflowId: 'workflow-id',
+        ...parameters,
     };
     return {
         calls,
@@ -234,3 +235,77 @@ for (const [type, wrong] of [
         assert.equal(context.calls.length, 1);
     });
 }
+
+// Exercise the declarative dispatch hook with expression values, preserving the request
+// so the API remains responsible for converting saved-node parameter values.
+for (const [type, values] of [
+    ['float', ['5', '5.5', ' 2.25 ', '-.5', '+5.', '1e3', '-2.5E-2', '1_000.5', 5.5]],
+    ['boolean', ['1', '0', 'True', 'FALSE', 'tRuE', 'fAlSe', 1, 0, true, false]],
+    ['string', [42, 4.2, true, false, 0, ['a', 1], { key: 'value' }, '42']],
+    ['integer', ['5', ' 5 ', '-3', '+7', 5]],
+    ['json', ['{"k": 1}', '[1,2]', { k: 1 }, [1, 2]]],
+]) {
+    for (const value of values) {
+        test(`dispatch preserves API-compatible ${type} ${typeof value} ${JSON.stringify(value)}`, async () => {
+            const context = makeContext({
+                request: (url) => {
+                    assert.equal(url, '/api/v1/workflows/workflow-id');
+                    return {
+                        workflow_definition: {
+                            parameters: [{ key: 'field', parameter_type: 'workflow', workflow_parameter_type: type }],
+                        },
+                    };
+                },
+            });
+            const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+            const requestOptions = { body: { data: { field: value } } };
+            const before = structuredClone(requestOptions);
+
+            const result = await operation.routing.send.preSend[0].call(context, requestOptions);
+
+            assert.equal(result, requestOptions);
+            assert.deepEqual(result, before);
+            assert.equal(context.calls.length, 1);
+        });
+    }
+}
+
+for (const [type, values, expected] of [
+    ['float', ['abc', '', '   ', '0x10', '0b10', '0o10', '5x', '1__0', '_5', '5_', '1e999', 'NaN', 'Infinity', NaN, Infinity, true, {}, []], 'a number'],
+    ['boolean', ['yes', '2', ' true ', ' 1 ', 'true\n', 'false\r', '1\n', 2, -1, {}, [], ['true'], [1]], 'a boolean'],
+    ['integer', ['5.5', 'abc', '1e3', true, 5.5], 'an integer'],
+    ['json', ['{bad', '', '   '], 'a JSON object or array'],
+    ['credential_id', [7, {}], 'a credential ID'],
+    ['file_url', [42, true, {}], 'a string'],
+]) {
+    for (const [index, value] of values.entries()) {
+        test(`dispatch rejects malformed ${type} case ${index}: ${String(value)}`, async () => {
+            const context = makeContext({
+                request: () => ({
+                    workflow_definition: {
+                        parameters: [{ key: 'field', parameter_type: 'workflow', workflow_parameter_type: type }],
+                    },
+                }),
+            });
+            const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+
+            await assert.rejects(
+                () => operation.routing.send.preSend[0].call(context, { body: { data: { field: value } } }),
+                { message: `Workflow parameter "field" must be ${expected}.` },
+            );
+            assert.equal(context.calls.length, 1);
+        });
+    }
+}
+
+test('Get a Workflow Run skips dispatch validation and workflow lookup', async () => {
+    const context = makeContext({
+        parameters: { workflowOperation: 'getWorkflow' },
+        request: () => assert.fail('Get must not load the workflow for dispatch validation'),
+    });
+    const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+    const requestOptions = { body: { data: { field: 'not a number' } } };
+
+    assert.equal(await operation.routing.send.preSend[0].call(context, requestOptions), requestOptions);
+    assert.equal(context.calls.length, 0);
+});
