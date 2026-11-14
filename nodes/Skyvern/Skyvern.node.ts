@@ -193,11 +193,14 @@ export class Skyvern implements INodeType {
                                     `/api/v1/workflows/${workflowId}`,
                                 );
                                 for (const parameter of workflow.workflow_definition.parameters as any[]) {
-                                    let value = data[parameter.key];
+                                    if (
+                                        parameter.parameter_type !== 'workflow' ||
+                                        !Object.prototype.hasOwnProperty.call(data, parameter.key)
+                                    ) continue;
+                                    const value = data[parameter.key];
                                     if (value === undefined || value === null) continue;
 
-                                    const type = parameter.parameter_type === 'credential' ? 'credential_id' :
-                                        parameter.workflow_parameter_type;
+                                    const type = parameter.workflow_parameter_type;
                                     let expected: string;
                                     switch (type) {
                                         case 'string':
@@ -214,7 +217,7 @@ export class Skyvern implements INodeType {
                                         case 'integer':
                                             if (
                                                 (typeof value === 'number' && Number.isInteger(value)) ||
-                                                (typeof value === 'string' && /^[+-]?\d+$/.test(value.trim()))
+                                                (typeof value === 'string' && /^[+-]?\d(?:_?\d)*$/.test(value.trim()))
                                             ) continue;
                                             expected = 'an integer';
                                             break;
@@ -238,13 +241,14 @@ export class Skyvern implements INodeType {
                                         case 'json':
                                             if (typeof value === 'string') {
                                                 try {
-                                                    value = JSON.parse(value);
+                                                    JSON.parse(value);
+                                                    continue;
                                                 } catch {
-                                                    // Invalid JSON remains a string and fails the type check below.
+                                                    // Malformed JSON text fails the check below.
                                                 }
                                             }
                                             if (typeof value === 'object' && value !== null) continue;
-                                            expected = 'a JSON object or array';
+                                            expected = 'valid JSON';
                                             break;
                                         default:
                                             continue;
@@ -596,46 +600,44 @@ export class Skyvern implements INodeType {
                     }
                 }
 
-                const fields: ResourceMapperField[] = await Promise.all(
-                    parameters
-                        .filter((parameter: any) => parameter.parameter_type === 'workflow')
-                        .map(async (parameter: any) => {
-                            let options: INodePropertyOptions[] | undefined = undefined;
-                            let parameterType: FieldType | undefined = undefined;
-                            if (parameter.workflow_parameter_type === 'credential_id') {
-                                if (credentials === undefined) {
-                                    parameterType = 'string';
-                                } else {
-                                    options = credentials.map((credential: any) => ({
-                                        name: credential.name,
-                                        value: credential.credential_id,
-                                    }));
-                                    parameterType = 'options';
-                                }
+                const fields: ResourceMapperField[] = parameters
+                    .filter((parameter: any) => parameter.parameter_type === 'workflow')
+                    .map((parameter: any) => {
+                        let options: INodePropertyOptions[] | undefined = undefined;
+                        let parameterType: FieldType | undefined = undefined;
+                        if (parameter.workflow_parameter_type === 'credential_id') {
+                            if (credentials === undefined) {
+                                parameterType = 'string';
                             } else {
-                                const parameter_type_map: Record<string, FieldType> = {
-                                    string: 'string',
-                                    integer: 'number',
-                                    float: 'number',
-                                    boolean: 'boolean',
-                                    json: 'object',
-                                    file_url: 'url',
-                                }
-                                parameterType = parameter_type_map[parameter.workflow_parameter_type];
+                                options = credentials.map((credential: any) => ({
+                                    name: credential.name,
+                                    value: credential.credential_id,
+                                }));
+                                parameterType = 'options';
                             }
+                        } else {
+                            const parameter_type_map: Record<string, FieldType> = {
+                                string: 'string',
+                                integer: 'number',
+                                float: 'number',
+                                boolean: 'boolean',
+                                json: 'object',
+                                file_url: 'url',
+                            }
+                            parameterType = parameter_type_map[parameter.workflow_parameter_type];
+                        }
 
-                            return {
-                                id: parameter.key,
-                                displayName: parameter.key,
-                                defaultMatch: true,
-                                canBeUsedToMatch: false,
-                                required: parameter.default_value === undefined || parameter.default_value === null,
-                                display: true,
-                                type: parameterType,
-                                options: options,
-                            };
-                        })
-                );
+                        return {
+                            id: parameter.key,
+                            displayName: parameter.key,
+                            defaultMatch: true,
+                            canBeUsedToMatch: false,
+                            required: parameter.default_value === undefined || parameter.default_value === null,
+                            display: true,
+                            type: parameterType,
+                            options: options,
+                        };
+                    });
 
 
                 // HACK: If there are no parameters, add a empty field to avoid the resource mapper from crashing

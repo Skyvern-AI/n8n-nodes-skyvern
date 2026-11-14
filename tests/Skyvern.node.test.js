@@ -242,8 +242,8 @@ for (const [type, values] of [
     ['float', ['5', '5.5', ' 2.25 ', '-.5', '+5.', '1e3', '-2.5E-2', '1_000.5', 5.5]],
     ['boolean', ['1', '0', 'True', 'FALSE', 'tRuE', 'fAlSe', 1, 0, true, false]],
     ['string', [42, 4.2, true, false, 0, ['a', 1], { key: 'value' }, '42']],
-    ['integer', ['5', ' 5 ', '-3', '+7', 5]],
-    ['json', ['{"k": 1}', '[1,2]', { k: 1 }, [1, 2]]],
+    ['integer', ['5', ' 5 ', '-3', '+7', '1_000', '-1_000', '+1_000', ' 1_000 ', 5]],
+    ['json', ['{"k": 1}', '[1,2]', '42', '"hello"', 'true', 'false', 'null', { k: 1 }, [1, 2]]],
 ]) {
     for (const value of values) {
         test(`dispatch preserves API-compatible ${type} ${typeof value} ${JSON.stringify(value)}`, async () => {
@@ -273,8 +273,8 @@ for (const [type, values] of [
 for (const [type, values, expected] of [
     ['float', ['abc', '', '   ', '0x10', '0b10', '0o10', '5x', '1__0', '_5', '5_', '1e999', 'NaN', 'Infinity', NaN, Infinity, true, {}, []], 'a number'],
     ['boolean', ['yes', '2', ' true ', ' 1 ', 'true\n', 'false\r', '1\n', 2, -1, {}, [], ['true'], [1]], 'a boolean'],
-    ['integer', ['5.5', 'abc', '1e3', true, 5.5], 'an integer'],
-    ['json', ['{bad', '', '   '], 'a JSON object or array'],
+    ['integer', ['5.5', 'abc', '1e3', '_5', '5_', '1__0', true, 5.5], 'an integer'],
+    ['json', ['{bad', '', '   ', '[1,]', 'undefined'], 'valid JSON'],
     ['credential_id', [7, {}], 'a credential ID'],
     ['file_url', [42, true, {}], 'a string'],
 ]) {
@@ -309,3 +309,41 @@ test('Get a Workflow Run skips dispatch validation and workflow lookup', async (
     assert.equal(await operation.routing.send.preSend[0].call(context, requestOptions), requestOptions);
     assert.equal(context.calls.length, 0);
 });
+
+test('dispatch ignores stale values for fixed credentials hidden from the mapper', async () => {
+    const context = makeContext({
+        request: () => ({
+            workflow_definition: {
+                parameters: [{ key: 'fixedCredential', parameter_type: 'credential', default_value: null }],
+            },
+        }),
+    });
+    const node = new Skyvern();
+    const fields = await node.methods.resourceMapping.getWorkflowRunParameters.call(context);
+    assert.equal(fields.fields.some((field) => field.id === 'fixedCredential'), false);
+    const operation = node.description.properties.find((property) => property.name === 'workflowOperation');
+    const requestOptions = { body: { data: { fixedCredential: 42 } } };
+    const before = structuredClone(requestOptions);
+
+    assert.equal(await operation.routing.send.preSend[0].call(context, requestOptions), requestOptions);
+    assert.deepEqual(requestOptions, before);
+});
+
+for (const key of ['constructor', 'toString', 'valueOf', '__proto__']) {
+    test(`dispatch validates only supplied own values for parameter ${key}`, async () => {
+        const context = makeContext({
+            request: () => ({
+                workflow_definition: {
+                    parameters: [{ key, parameter_type: 'workflow', workflow_parameter_type: 'integer', default_value: 5 }],
+                },
+            }),
+        });
+        const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+        const preSend = operation.routing.send.preSend[0];
+        const requestOptions = { body: { data: {} } };
+
+        assert.equal(await preSend.call(context, requestOptions), requestOptions);
+        const data = Object.fromEntries([[key, 'not an integer']]);
+        await assert.rejects(() => preSend.call(context, { body: { data } }), /must be an integer/);
+    });
+}
