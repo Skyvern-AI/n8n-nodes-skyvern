@@ -1,15 +1,17 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
+const { Expression } = require('n8n-workflow');
 const { Skyvern } = require('../dist/nodes/Skyvern/Skyvern.node.js');
 
 const pageSize = 100;
 
-function makeContext({ request }) {
+function makeContext({ request, parameters = {} }) {
     const calls = [];
     const nodeParameters = {
         resource: 'workflow',
         workflowOperation: 'dispatchWorkflow',
         workflowId: 'workflow-id',
+        ...parameters,
     };
     return {
         calls,
@@ -54,7 +56,7 @@ test('credential picker loads every page', async () => {
             if (url.startsWith('/api/v1/workflows/')) {
                 return {
                     workflow_definition: {
-                        parameters: [{ key: 'account', parameter_type: 'credential', default_value: null }],
+                        parameters: [{ key: 'account', parameter_type: 'workflow', workflow_parameter_type: 'credential_id', default_value: null }],
                     },
                 };
             }
@@ -79,7 +81,7 @@ test('credential lookup failure falls back to a plain input', async () => {
             if (url.startsWith('/api/v1/workflows/')) {
                 return {
                     workflow_definition: {
-                        parameters: [{ key: 'account', parameter_type: 'credential', default_value: null }],
+                        parameters: [{ key: 'account', parameter_type: 'workflow', workflow_parameter_type: 'credential_id', default_value: null }],
                     },
                 };
             }
@@ -125,3 +127,226 @@ test('browser session options map to top-level request fields', () => {
         assert.equal(property.routing.request.body[field], '={{$value ? $value : null}}');
     }
 });
+
+// Regression: the n8n editor stores a resource-mapper "object" field as JSON text, and declarative
+// routing passes it through unconverted, so preSend must accept JSON text.
+test('JSON parameter typed in the n8n editor is accepted', async () => {
+    const context = makeContext({
+        request: () => ({
+            workflow_definition: {
+                parameters: [{ key: 'config', parameter_type: 'workflow', workflow_parameter_type: 'json' }],
+            },
+        }),
+    });
+    const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+    const preSend = operation.routing.send.preSend[0];
+
+    await assert.doesNotReject(() => preSend.call(context, { body: { data: { config: '{"k": 1}' } } }));
+});
+
+test('fixed credential parameters are not run inputs', async () => {
+    const context = makeContext({
+        request: (url) => {
+            if (url.startsWith('/api/v1/workflows/')) {
+                return {
+                    workflow_definition: {
+                        parameters: [{ key: 'fixedCredential', parameter_type: 'credential', default_value: null }],
+                    },
+                };
+            }
+            return [];
+        },
+    });
+
+    const fields = await new Skyvern().methods.resourceMapping.getWorkflowRunParameters.call(context);
+
+    assert.equal(fields.fields.some((field) => field.id === 'fixedCredential'), false);
+});
+
+for (const [type, value] of [
+    ['integer', '5'],
+    ['boolean', 'true'],
+    ['boolean', 'false'],
+]) {
+    test(`API-coercible ${type} string is accepted`, async () => {
+        const context = makeContext({
+            request: () => ({
+                workflow_definition: {
+                    parameters: [{ key: 'field', parameter_type: 'workflow', workflow_parameter_type: type }],
+                },
+            }),
+        });
+        const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+        const preSend = operation.routing.send.preSend[0];
+
+        await assert.doesNotReject(() => preSend.call(context, { body: { data: { field: value } } }));
+    });
+}
+
+// Regression: run-time credential inputs are workflow parameters with workflow_parameter_type
+// "credential_id" and must get the credential picker; fixed "credential" parameters are not run inputs.
+test('credential_id workflow input gets the credential picker', async () => {
+    const context = makeContext({
+        request: (url) => {
+            if (url.startsWith('/api/v1/workflows/')) {
+                return {
+                    workflow_definition: {
+                        parameters: [
+                            { key: 'login', parameter_type: 'workflow', workflow_parameter_type: 'credential_id', default_value: null },
+                        ],
+                    },
+                };
+            }
+            return [{ name: 'Credential A', credential_id: 'cred_a' }];
+        },
+    });
+
+    const fields = await new Skyvern().methods.resourceMapping.getWorkflowRunParameters.call(context);
+
+    assert.equal(fields.fields[0].type, 'options');
+    assert.deepEqual(fields.fields[0].options, [{ name: 'Credential A', value: 'cred_a' }]);
+});
+
+// Regression coverage for the Get path and boolean/JSON validation.
+test('Get a Workflow Run path carries both the workflow and the run ID', () => {
+    const runId = new Skyvern().description.properties.find((property) => property.name === 'workflowRunId');
+    const url = Expression.resolveWithoutWorkflow(runId.routing.request.url.slice(1), {
+        $parameter: { workflowId: 'workflow-id' },
+        $value: 'run-id',
+    });
+    assert.equal(url, '/api/v1/workflows/workflow-id/runs/run-id');
+});
+
+for (const [type, wrong] of [
+    ['boolean', 'yes'],
+    ['json', 42],
+    ['float', 'NaN'],
+    ['credential_id', 7],
+]) {
+    test(`invalid ${type} workflow parameter fails before dispatch`, async () => {
+        const context = makeContext({
+            request: () => ({
+                workflow_definition: {
+                    parameters: [{ key: 'field', parameter_type: 'workflow', workflow_parameter_type: type }],
+                },
+            }),
+        });
+        const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+        const preSend = operation.routing.send.preSend[0];
+
+        await assert.rejects(() => preSend.call(context, { body: { data: { field: wrong } } }), /field/);
+        assert.equal(context.calls.length, 1);
+    });
+}
+
+// Exercise the declarative dispatch hook with expression values, preserving the request
+// so the API remains responsible for converting saved-node parameter values.
+for (const [type, values] of [
+    ['float', ['5', '5.5', ' 2.25 ', '-.5', '+5.', '1e3', '-2.5E-2', '1_000.5', 5.5]],
+    ['boolean', ['1', '0', 'True', 'FALSE', 'tRuE', 'fAlSe', 1, 0, true, false]],
+    ['string', [42, 4.2, true, false, 0, ['a', 1], { key: 'value' }, '42']],
+    ['integer', ['5', ' 5 ', '-3', '+7', '1_000', '-1_000', '+1_000', ' 1_000 ', 5]],
+    ['json', ['{"k": 1}', '[1,2]', '42', '"hello"', 'true', 'false', 'null', { k: 1 }, [1, 2]]],
+]) {
+    for (const value of values) {
+        test(`dispatch preserves API-compatible ${type} ${typeof value} ${JSON.stringify(value)}`, async () => {
+            const context = makeContext({
+                request: (url) => {
+                    assert.equal(url, '/api/v1/workflows/workflow-id');
+                    return {
+                        workflow_definition: {
+                            parameters: [{ key: 'field', parameter_type: 'workflow', workflow_parameter_type: type }],
+                        },
+                    };
+                },
+            });
+            const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+            const requestOptions = { body: { data: { field: value } } };
+            const before = structuredClone(requestOptions);
+
+            const result = await operation.routing.send.preSend[0].call(context, requestOptions);
+
+            assert.equal(result, requestOptions);
+            assert.deepEqual(result, before);
+            assert.equal(context.calls.length, 1);
+        });
+    }
+}
+
+for (const [type, values, expected] of [
+    ['float', ['abc', '', '   ', '0x10', '0b10', '0o10', '5x', '1__0', '_5', '5_', '1e999', 'NaN', 'Infinity', NaN, Infinity, true, {}, []], 'a number'],
+    ['boolean', ['yes', '2', ' true ', ' 1 ', 'true\n', 'false\r', '1\n', 2, -1, {}, [], ['true'], [1]], 'a boolean'],
+    ['integer', ['5.5', 'abc', '1e3', '_5', '5_', '1__0', true, 5.5], 'an integer'],
+    ['json', ['{bad', '', '   ', '[1,]', 'undefined'], 'valid JSON'],
+    ['credential_id', [7, {}], 'a credential ID'],
+    ['file_url', [42, true, {}], 'a string'],
+]) {
+    for (const [index, value] of values.entries()) {
+        test(`dispatch rejects malformed ${type} case ${index}: ${String(value)}`, async () => {
+            const context = makeContext({
+                request: () => ({
+                    workflow_definition: {
+                        parameters: [{ key: 'field', parameter_type: 'workflow', workflow_parameter_type: type }],
+                    },
+                }),
+            });
+            const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+
+            await assert.rejects(
+                () => operation.routing.send.preSend[0].call(context, { body: { data: { field: value } } }),
+                { message: `Workflow parameter "field" must be ${expected}.` },
+            );
+            assert.equal(context.calls.length, 1);
+        });
+    }
+}
+
+test('Get a Workflow Run skips dispatch validation and workflow lookup', async () => {
+    const context = makeContext({
+        parameters: { workflowOperation: 'getWorkflow' },
+        request: () => assert.fail('Get must not load the workflow for dispatch validation'),
+    });
+    const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+    const requestOptions = { body: { data: { field: 'not a number' } } };
+
+    assert.equal(await operation.routing.send.preSend[0].call(context, requestOptions), requestOptions);
+    assert.equal(context.calls.length, 0);
+});
+
+test('dispatch ignores stale values for fixed credentials hidden from the mapper', async () => {
+    const context = makeContext({
+        request: () => ({
+            workflow_definition: {
+                parameters: [{ key: 'fixedCredential', parameter_type: 'credential', default_value: null }],
+            },
+        }),
+    });
+    const node = new Skyvern();
+    const fields = await node.methods.resourceMapping.getWorkflowRunParameters.call(context);
+    assert.equal(fields.fields.some((field) => field.id === 'fixedCredential'), false);
+    const operation = node.description.properties.find((property) => property.name === 'workflowOperation');
+    const requestOptions = { body: { data: { fixedCredential: 42 } } };
+    const before = structuredClone(requestOptions);
+
+    assert.equal(await operation.routing.send.preSend[0].call(context, requestOptions), requestOptions);
+    assert.deepEqual(requestOptions, before);
+});
+
+for (const key of ['constructor', 'toString', 'valueOf', '__proto__']) {
+    test(`dispatch validates only supplied own values for parameter ${key}`, async () => {
+        const context = makeContext({
+            request: () => ({
+                workflow_definition: {
+                    parameters: [{ key, parameter_type: 'workflow', workflow_parameter_type: 'integer', default_value: 5 }],
+                },
+            }),
+        });
+        const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+        const preSend = operation.routing.send.preSend[0];
+        const requestOptions = { body: { data: {} } };
+
+        assert.equal(await preSend.call(context, requestOptions), requestOptions);
+        const data = Object.fromEntries([[key, 'not an integer']]);
+        await assert.rejects(() => preSend.call(context, { body: { data } }), /must be an integer/);
+    });
+}
