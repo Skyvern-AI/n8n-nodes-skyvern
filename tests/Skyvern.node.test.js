@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
+const { Expression } = require('n8n-workflow');
 const { Skyvern } = require('../dist/nodes/Skyvern/Skyvern.node.js');
 
 const pageSize = 100;
@@ -209,9 +210,11 @@ test('credential_id workflow input gets the credential picker', async () => {
 // Regression coverage for the Get path and boolean/JSON validation.
 test('Get a Workflow Run path carries both the workflow and the run ID', () => {
     const runId = new Skyvern().description.properties.find((property) => property.name === 'workflowRunId');
-    const url = runId.routing.request.url;
-    assert.match(url, /\$parameter\["workflowId"\]/);
-    assert.match(url, /\/runs\/" \+ \$value/);
+    const url = Expression.resolveWithoutWorkflow(runId.routing.request.url.slice(1), {
+        $parameter: { workflowId: 'workflow-id' },
+        $value: 'run-id',
+    });
+    assert.equal(url, '/api/v1/workflows/workflow-id/runs/run-id');
 });
 
 for (const [type, wrong] of [
