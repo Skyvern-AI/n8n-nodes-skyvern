@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { Expression } = require('n8n-workflow');
+const { Expression, NodeOperationError } = require('n8n-workflow');
 const { Skyvern } = require('../dist/nodes/Skyvern/Skyvern.node.js');
 
 const pageSize = 100;
@@ -30,6 +30,178 @@ function makeContext({ request, parameters = {} }) {
 
 function pageFrom(url) {
     return Number(new URL(url, 'https://example.test').searchParams.get('page') || 1);
+}
+
+for (const [label, defaults] of [['missing', {}], ['null', { default_value: null }]]) {
+    test(`empty required string fails before dispatch with ${label} default`, async () => {
+        const context = makeContext({
+            request: (url) => {
+                assert.equal(url, '/api/v1/workflows/workflow-id');
+                return { workflow_definition: { parameters: [
+                    { key: 'field', parameter_type: 'workflow', workflow_parameter_type: 'string', ...defaults },
+                ] } };
+            },
+        });
+        const node = new Skyvern();
+        const fields = await node.methods.resourceMapping.getWorkflowRunParameters.call(context);
+        assert.equal(fields.fields[0].required, true);
+        context.calls.length = 0;
+        const operation = node.description.properties.find((property) => property.name === 'workflowOperation');
+        const requestOptions = { body: { data: { field: '' } } };
+
+        await assert.rejects(() => operation.routing.send.preSend[0].call(context, requestOptions), {
+            name: 'NodeOperationError',
+            message: 'Workflow parameter "field" must be a non-empty string.',
+        });
+        assert.deepEqual(context.calls, ['/api/v1/workflows/workflow-id']);
+        assert.deepEqual(requestOptions, { body: { data: { field: '' } } });
+    });
+}
+
+for (const defaultValue of ['', 'fallback']) {
+    test(`defaulted string preserves empty and omitted inputs with default ${JSON.stringify(defaultValue)}`, async () => {
+        const context = makeContext({
+            request: () => ({ workflow_definition: { parameters: [
+                { key: 'field', parameter_type: 'workflow', workflow_parameter_type: 'string', default_value: defaultValue },
+            ] } }),
+        });
+        const node = new Skyvern();
+        const fields = await node.methods.resourceMapping.getWorkflowRunParameters.call(context);
+        assert.equal(fields.fields[0].required, false);
+        const operation = node.description.properties.find((property) => property.name === 'workflowOperation');
+        for (const data of [{ field: '' }, {}, { field: null }, { field: undefined }]) {
+            const requestOptions = { body: { data } };
+            const before = structuredClone(requestOptions);
+            assert.equal(await operation.routing.send.preSend[0].call(context, requestOptions), requestOptions);
+            assert.deepEqual(requestOptions, before);
+        }
+    });
+}
+
+test('required string preserves valid saved expressions and API handling of absent values', async () => {
+    const context = makeContext({
+        request: () => ({ workflow_definition: { parameters: [
+            { key: 'field', parameter_type: 'workflow', workflow_parameter_type: 'string', default_value: null },
+        ] } }),
+    });
+    const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+    const values = ['text', ' ', 42, false, ['a', 1], { key: 'value' }].map((value) =>
+        Expression.resolveWithoutWorkflow('{{ $json.value }}', { $json: { value } }));
+    for (const data of [...values.map((field) => ({ field })), {}, { field: null }, { field: undefined }]) {
+        const requestOptions = { body: { data } };
+        const before = structuredClone(requestOptions);
+        assert.equal(await operation.routing.send.preSend[0].call(context, requestOptions), requestOptions);
+        assert.deepEqual(requestOptions, before);
+    }
+});
+
+for (const [label, response] of [['object', {}], ['null', null], ['undefined', undefined], ['text', 'not an array'], ['array-like', { length: 0 }]]) {
+    for (const badPage of [1, 2]) {
+        test(`workflow picker reports a node error for ${label} on page ${badPage}`, async () => {
+            const context = makeContext({
+                request: (url) => pageFrom(url) === badPage ? response : Array.from({ length: pageSize }, (_, index) => ({
+                    title: `Workflow ${index}`, workflow_permanent_id: String(index),
+                })),
+            });
+
+            await assert.rejects(() => new Skyvern().methods.loadOptions.getWorkflows.call(context), (error) => {
+                assert.ok(error instanceof NodeOperationError);
+                assert.match(error.message, /expected an array/i);
+                assert.match(error.message, new RegExp(`page ${badPage}\\b`));
+                return true;
+            });
+            assert.equal(context.calls.length, badPage);
+        });
+    }
+}
+
+for (const count of [0, 1, 100, 200, 1082]) {
+    test(`workflow picker terminates and preserves all ${count} entries`, async () => {
+        const workflows = Array.from({ length: count }, (_, index) => ({
+            title: `Workflow ${index}`, workflow_permanent_id: String(index),
+        }));
+        const context = makeContext({
+            request: (url) => {
+                const offset = (pageFrom(url) - 1) * pageSize;
+                return workflows.slice(offset, offset + pageSize);
+            },
+        });
+
+        const options = await new Skyvern().methods.loadOptions.getWorkflows.call(context);
+
+        assert.deepEqual(options, workflows.map((workflow) => ({ name: workflow.title, value: workflow.workflow_permanent_id })));
+        assert.deepEqual(context.calls, Array.from({ length: Math.floor(count / pageSize) + 1 }, (_, index) =>
+            `/api/v1/workflows?page=${index + 1}&page_size=100`));
+    });
+}
+
+test('workflow picker preserves a later-page HTTP error', async () => {
+    const httpError = new Error('HTTP 503 on page 2');
+    const context = makeContext({
+        request: (url) => {
+            if (pageFrom(url) === 2) throw httpError;
+            return Array.from({ length: pageSize }, (_, index) => ({
+                title: `Workflow ${index}`, workflow_permanent_id: String(index),
+            }));
+        },
+    });
+
+    await assert.rejects(() => new Skyvern().methods.loadOptions.getWorkflows.call(context), (error) => error === httpError);
+    assert.equal(context.calls.length, 2);
+});
+
+test('workflow picker bounds full pages when the server ignores pagination', async () => {
+    const fullPage = Array.from({ length: pageSize }, (_, index) => ({
+        title: `Workflow ${index}`, workflow_permanent_id: String(index),
+    }));
+    const context = makeContext({
+        request: (url) => {
+            if (pageFrom(url) > 1000) throw new Error('Test safety guard: pagination did not stop');
+            return fullPage;
+        },
+    });
+
+    await assert.rejects(() => new Skyvern().methods.loadOptions.getWorkflows.call(context), {
+        name: 'NodeOperationError',
+        message: 'Pagination stopped after 1000 pages because the last page was full.',
+    });
+    assert.equal(context.calls.length, 1000);
+    assert.equal(pageFrom(context.calls.at(-1)), 1000);
+});
+
+test('workflow picker accepts a short final page at the pagination limit', async () => {
+    const context = makeContext({
+        request: (url) => Array.from({ length: pageFrom(url) === 1000 ? 1 : pageSize }, (_, index) => ({
+            title: `Workflow ${pageFrom(url)}-${index}`, workflow_permanent_id: `${pageFrom(url)}-${index}`,
+        })),
+    });
+
+    const options = await new Skyvern().methods.loadOptions.getWorkflows.call(context);
+
+    assert.equal(options.length, 99901);
+    assert.equal(options.at(-1).value, '1000-0');
+    assert.equal(context.calls.length, 1000);
+});
+
+for (const failure of ['malformed page', 'pagination limit']) {
+    test(`credential picker falls back to a plain input after ${failure}`, async () => {
+        const context = makeContext({
+            request: (url) => {
+                if (url.startsWith('/api/v1/workflows/')) return { workflow_definition: { parameters: [
+                    { key: 'account', parameter_type: 'workflow', workflow_parameter_type: 'credential_id', default_value: null },
+                ] } };
+                if (failure === 'malformed page') return 'not an array';
+                if (pageFrom(url) > 1000) throw new Error('Test safety guard: pagination did not stop');
+                return Array.from({ length: pageSize }, (_, index) => ({ name: `Credential ${index}`, credential_id: String(index) }));
+            },
+        });
+
+        const fields = await new Skyvern().methods.resourceMapping.getWorkflowRunParameters.call(context);
+
+        assert.equal(fields.fields[0].type, 'string');
+        assert.equal(fields.fields[0].options, undefined);
+        assert.equal(context.calls.length, failure === 'malformed page' ? 2 : 1001);
+    });
 }
 
 test('workflow picker loads every page', async () => {

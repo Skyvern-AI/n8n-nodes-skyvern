@@ -36,16 +36,27 @@ async function skyvernApiRequestAllPages<T>(
     endpoint: string,
 ): Promise<T[]> {
     const pageSize = 100;
+    const maxPages = 1000;
     const results: T[] = [];
-    for (let page = 1; ; page++) {
+    for (let page = 1; page <= maxPages; page++) {
         const data = (await skyvernApiRequest.call(
             this,
             'GET',
             `${endpoint}?page=${page}&page_size=${pageSize}`,
         )) as T[];
+        if (!Array.isArray(data)) {
+            throw new NodeOperationError(
+                this.getNode(),
+                `Invalid pagination response on page ${page}: expected an array.`,
+            );
+        }
         results.push(...data);
         if (data.length < pageSize) return results;
     }
+    throw new NodeOperationError(
+        this.getNode(),
+        `Pagination stopped after ${maxPages} pages because the last page was full.`,
+    );
 }
 
 export class Skyvern implements INodeType {
@@ -204,6 +215,10 @@ export class Skyvern implements INodeType {
                                     let expected: string;
                                     switch (type) {
                                         case 'string':
+                                            if (value === '' && (parameter.default_value === undefined || parameter.default_value === null)) {
+                                                expected = 'a non-empty string';
+                                                break;
+                                            }
                                             // The API stringifies expression results; keep the supplied value unchanged.
                                             continue;
                                         case 'file_url':
