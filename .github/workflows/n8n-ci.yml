@@ -9,6 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -22,3 +24,5 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Build and Lint
         run: pnpm prepublishOnly
+      - name: Run regression suite
+        run: pnpm test
