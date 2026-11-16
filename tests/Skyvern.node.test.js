@@ -350,3 +350,105 @@ for (const key of ['constructor', 'toString', 'valueOf', '__proto__']) {
         await assert.rejects(() => preSend.call(context, { body: { data } }), /must be an integer/);
     });
 }
+
+// QA R3 (SKY-18380) DO NOT MERGE: repro tests for behaviours the suite above does not pin.
+// Each test passes at the merge commit and fails under one plausible one-line mutation.
+
+function apiLikeList(items) {
+    // The API pages with page_size defaulting to 10 when the client omits it.
+    return (url) => {
+        const params = new URL(url, 'https://example.test').searchParams;
+        const page = Number(params.get('page') || 1);
+        const size = Number(params.get('page_size') || 10);
+        return items.slice((page - 1) * size, page * size);
+    };
+}
+
+test('QA R3: workflow picker lists every workflow when the API default page size is smaller', async () => {
+    const items = Array.from({ length: 25 }, (_, i) => ({ title: `W${i}`, workflow_permanent_id: `wpid_${i}` }));
+    const context = makeContext({ request: apiLikeList(items) });
+    const workflows = await new Skyvern().methods.loadOptions.getWorkflows.call(context);
+    assert.deepEqual(workflows.map((w) => w.value), items.map((w) => w.workflow_permanent_id));
+});
+
+test('QA R3: credential picker lists every credential when the API default page size is smaller', async () => {
+    const creds = Array.from({ length: 25 }, (_, i) => ({ name: `C${i}`, credential_id: `cred_${i}` }));
+    const list = apiLikeList(creds);
+    const context = makeContext({
+        request: (url) => url.startsWith('/api/v1/workflows/')
+            ? { workflow_definition: { parameters: [{ key: 'login', parameter_type: 'workflow', workflow_parameter_type: 'credential_id', default_value: null }] } }
+            : list(url),
+    });
+    const fields = await new Skyvern().methods.resourceMapping.getWorkflowRunParameters.call(context);
+    assert.equal(fields.fields[0].options.length, 25);
+});
+
+test('QA R3: dispatch of a workflow with no run parameters (mapper value null) is not blocked', async () => {
+    const context = makeContext({ request: () => assert.fail('no lookup expected without run data') });
+    const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+    const requestOptions = { body: { data: null } };
+    assert.equal(await operation.routing.send.preSend[0].call(context, requestOptions), requestOptions);
+});
+
+test('QA R3: blank optional inputs are left for the API default', async () => {
+    const context = makeContext({
+        request: () => ({
+            workflow_definition: {
+                parameters: ['integer', 'float', 'boolean', 'json', 'file_url', 'credential_id'].map((type) => ({
+                    key: type, parameter_type: 'workflow', workflow_parameter_type: type, default_value: null,
+                })),
+            },
+        }),
+    });
+    const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+    for (const blank of [null, undefined]) {
+        const data = Object.fromEntries(['integer', 'float', 'boolean', 'json', 'file_url', 'credential_id'].map((type) => [type, blank]));
+        await assert.doesNotReject(() => operation.routing.send.preSend[0].call(context, { body: { data } }), `blank ${blank}`);
+    }
+});
+
+test('QA R3: credentials are not requested for workflows without credential_id inputs', async () => {
+    const context = makeContext({
+        request: () => ({ workflow_definition: { parameters: [{ key: 'n', parameter_type: 'workflow', workflow_parameter_type: 'integer', default_value: 1 }] } }),
+    });
+    await new Skyvern().methods.resourceMapping.getWorkflowRunParameters.call(context);
+    assert.deepEqual(context.calls, ['/api/v1/workflows/workflow-id']);
+});
+
+// Pre-existing behaviour (present in 0.0.11) that the suite never pins.
+test('QA R3 (pre-existing): dispatch posts the mapper values to the workflow run URL', () => {
+    const mapper = new Skyvern().description.properties.find((property) => property.name === 'workflowRunParameters');
+    const resolve = (expr, value) => Expression.resolveWithoutWorkflow(expr.slice(1), { $parameter: { workflowId: 'wpid_1' }, $value: value });
+    assert.equal(resolve(mapper.routing.request.url, {}), '/api/v1/workflows/wpid_1/run');
+    assert.deepEqual(Object.keys(mapper.routing.request.body), ['data']);
+    assert.deepEqual(resolve(mapper.routing.request.body.data, { mappingMode: 'defineBelow', value: { a: 1 } }), { a: 1 });
+});
+
+test('QA R3 (pre-existing): workflow picker option value is the permanent ID', async () => {
+    const context = makeContext({ request: () => [{ title: 'W', workflow_permanent_id: 'wpid_1', workflow_id: 'w_1' }] });
+    assert.deepEqual(await new Skyvern().methods.loadOptions.getWorkflows.call(context), [{ name: 'W', value: 'wpid_1' }]);
+});
+
+test('QA R3 (pre-existing): mapper field types and required flags follow the workflow definition', async () => {
+    const types = { string: 'string', integer: 'number', float: 'number', boolean: 'boolean', json: 'object', file_url: 'url' };
+    const parameters = Object.keys(types).flatMap((type) => [
+        { key: `${type}_req`, parameter_type: 'workflow', workflow_parameter_type: type, default_value: null },
+        { key: `${type}_opt`, parameter_type: 'workflow', workflow_parameter_type: type, default_value: type === 'boolean' ? false : 0 },
+    ]);
+    const context = makeContext({ request: () => ({ workflow_definition: { parameters } }) });
+    const { fields } = await new Skyvern().methods.resourceMapping.getWorkflowRunParameters.call(context);
+    for (const [type, fieldType] of Object.entries(types)) {
+        const req = fields.find((field) => field.id === `${type}_req`);
+        const opt = fields.find((field) => field.id === `${type}_opt`);
+        assert.equal(req.type, fieldType, type);
+        assert.equal(req.required, true, `${type} without default`);
+        assert.equal(opt.required, false, `${type} with default`);
+        assert.equal(req.display, true);
+    }
+});
+
+test('QA R3 (pre-existing): workflow without run inputs gets the placeholder field', async () => {
+    const context = makeContext({ request: () => ({ workflow_definition: { parameters: [] } }) });
+    const { fields } = await new Skyvern().methods.resourceMapping.getWorkflowRunParameters.call(context);
+    assert.deepEqual(fields.map((field) => field.id), ['NO_PARAMETERS']);
+});
