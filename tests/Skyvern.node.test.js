@@ -32,6 +32,13 @@ function pageFrom(url) {
     return Number(new URL(url, 'https://example.test').searchParams.get('page') || 1);
 }
 
+function apiPage(items, url) {
+    const params = new URL(url, 'https://example.test').searchParams;
+    // The API defaults to 10 items unless the client explicitly sends page_size.
+    const size = Number(params.get('page_size') || 10);
+    return items.slice((pageFrom(url) - 1) * size, pageFrom(url) * size);
+}
+
 for (const [label, defaults] of [['missing', {}], ['null', { default_value: null }]]) {
     test(`empty required string fails before dispatch with ${label} default`, async () => {
         const context = makeContext({
@@ -522,3 +529,120 @@ for (const key of ['constructor', 'toString', 'valueOf', '__proto__']) {
         await assert.rejects(() => preSend.call(context, { body: { data } }), /must be an integer/);
     });
 }
+
+test('workflow picker preserves all entries with the API default page size of 10', async () => {
+    const items = Array.from({ length: pageSize + 25 }, (_, index) => ({
+        title: `Workflow ${index}`,
+        workflow_permanent_id: `workflow-${index}`,
+    }));
+    const context = makeContext({
+        request: (url) => {
+            assert.equal(new URL(url, 'https://example.test').pathname, '/api/v1/workflows');
+            return apiPage(items, url);
+        },
+    });
+
+    const workflows = await new Skyvern().methods.loadOptions.getWorkflows.call(context);
+
+    assert.deepEqual(workflows, items.map((item) => ({ name: item.title, value: item.workflow_permanent_id })));
+    assert.deepEqual(context.calls, [
+        '/api/v1/workflows?page=1&page_size=100',
+        '/api/v1/workflows?page=2&page_size=100',
+    ]);
+});
+
+test('credential picker preserves all entries with the API default page size of 10', async () => {
+    const items = Array.from({ length: pageSize + 25 }, (_, index) => ({
+        name: `Credential ${index}`,
+        credential_id: `credential-${index}`,
+    }));
+    const context = makeContext({
+        request: (url) => {
+            if (url === '/api/v1/workflows/workflow-id') {
+                return {
+                    workflow_definition: {
+                        parameters: [{ key: 'account', parameter_type: 'workflow', workflow_parameter_type: 'credential_id', default_value: null }],
+                    },
+                };
+            }
+            assert.equal(new URL(url, 'https://example.test').pathname, '/api/v1/credentials');
+            return apiPage(items, url);
+        },
+    });
+
+    const { fields } = await new Skyvern().methods.resourceMapping.getWorkflowRunParameters.call(context);
+
+    assert.deepEqual(fields.find((field) => field.id === 'account').options,
+        items.map((item) => ({ name: item.name, value: item.credential_id })));
+    assert.deepEqual(context.calls, [
+        '/api/v1/workflows/workflow-id',
+        '/api/v1/credentials?page=1&page_size=100',
+        '/api/v1/credentials?page=2&page_size=100',
+    ]);
+});
+
+test('dispatch preserves null mapper data for a workflow without run inputs', async () => {
+    const context = makeContext({
+        request: () => assert.fail('null mapper data must not trigger a validation lookup'),
+    });
+    const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+    const requestOptions = { body: { data: null } };
+    const before = structuredClone(requestOptions);
+
+    const result = await operation.routing.send.preSend[0].call(context, requestOptions);
+
+    assert.equal(result, requestOptions);
+    assert.deepEqual(requestOptions, before);
+    assert.deepEqual(context.calls, []);
+});
+
+test('dispatch preserves null and undefined inputs for server defaults', async () => {
+    const parameters = [
+        ['string', 'guest'],
+        ['integer', 5],
+        ['float', 1.5],
+        ['boolean', false],
+        ['json', { enabled: true }],
+        ['file_url', 'https://example.test/default.csv'],
+        ['credential_id', 'default-credential'],
+    ].map(([type, defaultValue]) => ({
+        key: type, parameter_type: 'workflow', workflow_parameter_type: type, default_value: defaultValue,
+    }));
+    const operation = new Skyvern().description.properties.find((property) => property.name === 'workflowOperation');
+    for (const blank of [null, undefined]) {
+        const context = makeContext({
+            request: (url) => {
+                assert.equal(url, '/api/v1/workflows/workflow-id');
+                return { workflow_definition: { parameters } };
+            },
+        });
+        const data = Object.fromEntries(parameters.map((parameter) => [parameter.key, blank]));
+        const requestOptions = { body: { data, browser_session_id: 'saved-session' } };
+        const before = structuredClone(requestOptions);
+
+        const result = await operation.routing.send.preSend[0].call(context, requestOptions);
+
+        assert.equal(result, requestOptions);
+        assert.deepEqual(requestOptions, before);
+        assert.deepEqual(context.calls, ['/api/v1/workflows/workflow-id']);
+    }
+});
+
+test('mapper skips credential lookup when no credential_id run input exists', async () => {
+    for (const parameters of [
+        [],
+        [{ key: 'count', parameter_type: 'workflow', workflow_parameter_type: 'integer', default_value: 1 }],
+        [{ key: 'fixedCredential', parameter_type: 'credential', default_value: null }],
+    ]) {
+        const context = makeContext({
+            request: (url) => {
+                assert.equal(url, '/api/v1/workflows/workflow-id');
+                return { workflow_definition: { parameters } };
+            },
+        });
+
+        await new Skyvern().methods.resourceMapping.getWorkflowRunParameters.call(context);
+
+        assert.deepEqual(context.calls, ['/api/v1/workflows/workflow-id']);
+    }
+});
