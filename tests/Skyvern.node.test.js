@@ -409,12 +409,10 @@ test('QA R3: blank optional inputs are left for the API default', async () => {
 
 test('QA R3: credentials are not requested for workflows without credential_id inputs', async () => {
     const context = makeContext({
-        request: (url) => {
-            assert.ok(!url.startsWith('/api/v1/credentials'), 'unexpected credentials request');
-            return { workflow_definition: { parameters: [{ key: 'n', parameter_type: 'workflow', workflow_parameter_type: 'integer', default_value: 1 }] } };
-        },
+        request: () => ({ workflow_definition: { parameters: [{ key: 'n', parameter_type: 'workflow', workflow_parameter_type: 'integer', default_value: 1 }] } }),
     });
     await new Skyvern().methods.resourceMapping.getWorkflowRunParameters.call(context);
+    assert.deepEqual(context.calls, ['/api/v1/workflows/workflow-id']);
 });
 
 // Pre-existing behaviour (present in 0.0.11) that the suite never pins.
